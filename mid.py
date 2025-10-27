@@ -1,0 +1,306 @@
+import network
+import socket
+import ujson
+import ntptime
+import time
+import uasyncio as asyncio
+from machine import Pin, PWM, I2C
+from ssd1306 import SSD1306_I2C
+import dht
+import utime
+
+# === Wi-Fi 設定 ===
+SSID = "444"
+PASSWORD = "obaba664"
+
+# === 硬體設定 ===
+button = Pin(17, Pin.IN, Pin.PULL_UP)
+button_next = Pin(21, Pin.IN, Pin.PULL_UP)
+
+buzzer = PWM(Pin(6))
+buzzer.duty(0)
+
+# alarms_file = "alarms.json"
+# alarms = []  # 儲存鬧鐘時間
+
+# === OLED 初始化 ===
+i2c = I2C(0, scl=Pin(7), sda=Pin(5))
+oled = SSD1306_I2C(128, 64, i2c)
+
+# === DHT11 初始化 ===
+dht_pin = Pin(18)
+sensor = dht.DHT11(dht_pin)
+
+# === 全域變數 ===
+temperature = None
+humidity = None
+last_sync = 0
+current_alarm_index = 0
+
+
+# === Wi-Fi 連線 ===
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("連線中...")
+        wlan.connect(SSID, PASSWORD)
+        while not wlan.isconnected():
+            time.sleep(0.5)
+            print(".", end="")
+    print("\nWi-Fi 已連線:", wlan.ifconfig())
+
+# === 時間同步 ===
+def sync_time():
+    try:
+        ntptime.settime()
+        print("時間同步完成")
+    except Exception as e:
+        print("同步失敗:", e)
+
+def get_local_time():
+    return time.localtime(time.time() + 8 * 3600)  # 台灣時區
+
+# === DHT11 讀取任務 ===
+async def read_dht_task():
+    global temperature, humidity
+    while True:
+        try:
+            sensor.measure()
+            temperature = sensor.temperature()
+            humidity = sensor.humidity()
+            #print(temperature)
+        except Exception as e:
+            print("讀取 DHT11 失敗:", e)
+        await asyncio.sleep(10)  # 每3秒更新一次
+        
+def get_next_alarm():
+    """
+    找到下一個即將響的鬧鐘時間
+    回傳 (hour, minute) tuple，如果沒有鬧鐘回傳 None
+    """
+    now = get_local_time()
+    now_minutes = now[3] * 60 + now[4]  # 現在時間轉成分鐘
+
+    # 將鬧鐘時間也轉成分鐘
+    alarm_minutes = [(a["hour"]*60 + a["minute"], a) for a in alarms]
+
+    # 計算距離現在最近的鬧鐘（可以跨天）
+    min_diff = 24*60 + 1
+    next_alarm = None
+    for am, a in alarm_minutes:
+        diff = am - now_minutes
+        if diff < 0:
+            diff += 24*60  # 跨天
+        if diff < min_diff:
+            min_diff = diff
+            next_alarm = a
+
+    return next_alarm
+
+
+# === OLED 顯示任務 ===
+async def display_task():
+    global current_alarm_index
+
+    last_button_state = 1  # 記錄上一狀態避免重複觸發
+
+    while True:
+        t = get_local_time()
+        year, month, mday, hour, minute, second, _, _ = t
+        date_str = f"{year:04d}-{month:02d}-{mday:02d}"
+        time_str = f"{hour:02d}:{minute:02d}:{second:02d}"
+
+        oled.fill(0)
+        oled.text("WiFi Clock+DHT11", 0, 0)
+        oled.text(date_str, 0, 12)
+        oled.text(time_str, 0, 24)
+
+        # 溫濕度顯示
+        if temperature is not None:
+            oled.text(f"T:{temperature:2d}C", 0, 36)
+        else:
+            oled.text("T:--C", 0, 36)
+        if humidity is not None:
+            oled.text(f"H:{humidity:2d}%", 64, 36)
+        else:
+            oled.text("H:--%", 64, 36)
+
+        # 檢查按鈕是否被按下（防抖）
+        button_state = button_next.value()
+        if last_button_state == 1 and button_state == 0:  # 偵測下降沿
+            if len(alarms) > 0:
+                current_alarm_index = (current_alarm_index + 1) % len(alarms)
+                print(f"切換顯示到第 {current_alarm_index+1} 個鬧鐘")
+        last_button_state = button_state
+
+        # 顯示當前選擇的鬧鐘
+        if len(alarms) > 0:
+            a = alarms[current_alarm_index]
+            oled.text(f"Alarm:{a['hour']:02d}:{a['minute']:02d}", 0, 48)
+        else:
+            oled.text("No Alarms", 0, 48)
+
+        oled.show()
+        await asyncio.sleep(0.4)
+
+
+# === 非同步鬧鐘聲音 ===
+# === 音階與樂曲 ===
+NOTE_FREQS = {
+    'C4': 262, 'D4': 294, 'E4': 330, 'F4': 349, 'G4': 392,
+    'A4': 440, 'B4': 494, 'C5': 523, 'Bb4':466, 'G3': 196,
+    'E5': 659, 'D#5': 622, 'D5': 587, 'Ab4': 415, 'REST': 0
+}
+
+NOTES_TWINKLE = [
+    ('C4', 500), ('C4', 500), ('G4', 500), ('G4', 500),
+    ('A4', 500), ('A4', 500), ('G4', 1000),
+    ('F4', 500), ('F4', 500), ('E4', 500), ('E4', 500),
+    ('D4', 500), ('D4', 500), ('C4', 1000),
+]
+# === 播放音樂（非同步版本） ===
+async def play_song_async(speaker, notes):
+    for note, duration in notes:
+        if button.value() == 0:  # 按鈕停止
+            print("鬧鐘手動停止")
+            break
+        freq = NOTE_FREQS[note]
+        if freq == 0:
+            speaker.duty(0)
+        else:
+            speaker.freq(freq)
+            speaker.duty(512)
+        await asyncio.sleep(duration / 1000)  # 毫秒轉秒
+    speaker.duty(0)
+
+
+# === 非同步鬧鐘響起 ===
+async def ring_buzzer(duration=10):
+    print("鬧鐘響起，播放音樂！")
+    start = time.time()
+
+    # 重新初始化 speaker（確保可用）
+    global buzzer
+    buzzer = PWM(Pin(6))
+    buzzer.duty(0)
+
+    # 播放音樂（可改 NOTES_TWINKLE → NOTES_1, NOTES_2...）
+    await play_song_async(buzzer, NOTES_TWINKLE)
+
+    buzzer.duty(0)
+    print("音樂播放結束")
+    
+alarms = []
+
+def load_alarms():
+    global alarms
+    try:
+        with open("alarms.json", "r") as f:
+            alarms = ujson.load(f)
+    except:
+        alarms = []
+
+def save_alarms():
+    with open("alarms.json", "w") as f:
+        ujson.dump(alarms, f)
+
+# === 網頁伺服器 ===
+async def handle_client(reader, writer):
+    request = await reader.read(1024)
+    request = request.decode("utf-8")
+    path = request.split(" ")[1]
+    response = ""
+
+    # === 新增鬧鐘 ===
+    if path.startswith("/add?"):
+        try:
+            params = path.split("?")[1]
+            kv = {k: v for k, v in [p.split("=") for p in params.split("&")]}
+            hour = int(kv.get("hour", 0))
+            minute = int(kv.get("minute", 0))
+            alarms.append({"hour": hour, "minute": minute})
+            save_alarms()
+        except Exception as e:
+            print("Add error:", e)
+        response = "<meta http-equiv='refresh' content='0; url=/'/>"
+
+    # === 刪除鬧鐘 ===
+    elif path.startswith("/delete?"):
+        try:
+            params = path.split("?")[1]
+            kv = {k: v for k, v in [p.split("=") for p in params.split("&")]}
+            idx = int(kv.get("id", -1))
+            if 0 <= idx < len(alarms):
+                del alarms[idx]
+                save_alarms()
+        except Exception as e:
+            print("Delete error:", e)
+        response = "<meta http-equiv='refresh' content='0; url=/'/>"
+
+    # === 顯示主頁 ===
+    else:
+        response = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>ESP32 鬧鐘設定</title></head>
+<body>
+<h2>鬧鐘設定</h2>
+<form action="/add">
+  時: <input type="number" name="hour" min="0" max="23">
+  分: <input type="number" name="minute" min="0" max="59">
+  <input type="submit" value="新增">
+</form>
+<h3>目前鬧鐘：</h3><ul>
+"""
+        for i, a in enumerate(alarms):
+            response += f"<li>{a['hour']:02d}:{a['minute']:02d} <a href='/delete?id={i}'>刪除</a></li>"
+        response += "</ul></body></html>"
+
+    # === 傳送回應 ===
+    writer.write(b"HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n")
+    writer.write(response.encode("utf-8"))
+    await writer.drain()
+    await writer.aclose()
+    
+
+async def start_webserver():
+    load_alarms()
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 80)
+    print("WebServer 啟動中 http://<ESP32_IP>/")
+    async with server:
+        await server.wait_closed()
+# ===== 鬧鐘檢查任務 =====
+async def alarm_task():
+    while True:
+        now = get_local_time()
+        h, m = now[3], now[4]
+        for a in alarms:
+            if a["hour"] == h and a["minute"] == m:
+                await ring_buzzer()
+                await asyncio.sleep(60)  # 避免同分鐘重複響
+        await asyncio.sleep(1)
+
+
+# === 主程式 ===
+async def main():
+    connect_wifi()
+    sync_time()
+    load_alarms()
+
+    # 啟動非同步任務
+    tasks = [
+        asyncio.create_task(read_dht_task()),     # DHT11
+        asyncio.create_task(display_task()),      # OLED 顯示
+        asyncio.create_task(alarm_task()),        # 鬧鐘檢查
+        asyncio.create_task(start_webserver()),   # WebServer
+    ]
+
+    await asyncio.gather(*tasks)
+
+# 執行主程式
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print("程式結束")
+
+
