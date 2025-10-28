@@ -10,8 +10,8 @@ import dht
 import utime
 
 # === Wi-Fi 設定 ===
-SSID = "444"
-PASSWORD = "obaba664"
+SSID = ""
+PASSWORD = ""
 
 # === 硬體設定 ===
 button = Pin(17, Pin.IN, Pin.PULL_UP)
