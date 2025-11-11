@@ -281,12 +281,12 @@ NOTES_TWINKLE = [
     ('D4', 500), ('D4', 500), ('C4', 1000),
 ]
 # === 播放音樂（非同步版本） ===
-async def play_song_async(speaker, notes):
+async def play_song_async(speaker, notes, stop_event):
+    """非同步播放歌曲，可由 stop_event 控制停止"""
     for note, duration in notes:
-        if button.value() == 0:  # 按鈕停止
-            print("鬧鐘手動停止")
+        if stop_event.is_set():
             break
-        freq = NOTE_FREQS[note]
+        freq = NOTE_FREQS.get(note, 0)
         if freq == 0:
             speaker.duty(0)
         else:
@@ -481,8 +481,8 @@ async def start_webserver():
     async with server:
         await server.wait_closed()
 # ===== 鬧鐘檢查任務 =====
-# ===== 鬧鐘檢查任務（支援日期、週期、延後） =====
-async def alarm_task(snooze_minutes=5):
+async def alarm_task(snooze_minutes=5, max_ring_time=60):
+    """鬧鐘任務，支援手動停止、自動停止、延後"""
     while True:
         now = get_local_time()
         h, m = now[3], now[4]
@@ -493,57 +493,65 @@ async def alarm_task(snooze_minutes=5):
             if not a.get("enabled", True):
                 continue
 
-            # 判斷是否應該響鬧鐘
+            # === 是否今日需響 ===
             is_today = False
             if a.get("date"):  # 指定日期鬧鐘
-                if a["date"] == today_date:
-                    is_today = True
-            elif a.get("weekdays"):  # 週期鬧鐘
-                if today_weekday in a["weekdays"]:
-                    is_today = True
-            else:  # 沒有設定日期與週期 → 每天響
+                is_today = a["date"] == today_date
+            elif a.get("weekdays"):  # 指定星期
+                is_today = today_weekday in a["weekdays"]
+            else:  # 無指定 → 每天
                 is_today = True
 
+            # === 鬧鐘觸發 ===
             if is_today and a["hour"] == h and a["minute"] == m:
                 print(f"鬧鐘響起: {h:02d}:{m:02d}")
                 
-                # 播放音樂並偵測延後按鈕
-                start = time.time()
-                buzzer_active = True
-                while buzzer_active:
-                    await play_song_async(buzzer, NOTES_TWINKLE)
-                    # 延後按鈕偵測
-                    if button_next.value() == 0:
-                        new_minute = m + snooze_minutes
-                        new_hour = h + new_minute // 60
-                        new_minute %= 60
-                        new_hour %= 24
-                        delayed_alarm = {
-                            "hour": new_hour,
-                            "minute": new_minute,
-                            "weekdays": [],  # 延後只響一次
-                            "enabled": True
-                        }
-                        alarms.append(delayed_alarm)
-                        save_alarms()
-                        print(f"延後 {snooze_minutes} 分鐘 → 新鬧鐘 {new_hour:02d}:{new_minute:02d}")
-                        buzzer_active = False
-                        break
-                    # 偵測停止按鈕
-                    if button.value() == 0:
+                stop_event = asyncio.Event()
+                ring_task = asyncio.create_task(play_song_async(buzzer, NOTES_TWINKLE, stop_event))
+                start_time = time.time()
+
+                while True:
+                    await asyncio.sleep(0.1)
+
+                    # 手動停止（任一按鈕）
+                    if button.value() == 0 or button_next.value() == 0:
                         print("鬧鐘手動停止")
-                        buzzer_active = False
+                        stop_event.set()
                         break
+
+                    # 自動停止超時
+                    if time.time() - start_time > max_ring_time:
+                        print("鬧鐘自動停止（超過最大時間）")
+                        stop_event.set()
+                        break
+
+                await ring_task  # 等待播放結束
+                buzzer.duty(0)
+
+                # === 延後功能 ===
+                if button_next.value() == 0:  # 按下「延後」
+                    new_minute = m + snooze_minutes
+                    new_hour = h + new_minute // 60
+                    new_minute %= 60
+                    new_hour %= 24
+                    delayed_alarm = {
+                        "hour": new_hour,
+                        "minute": new_minute,
+                        "weekdays": [],  # 單次響
+                        "enabled": True
+                    }
+                    alarms.append(delayed_alarm)
+                    save_alarms()
+                    print(f"延後 {snooze_minutes} 分鐘 → 新鬧鐘 {new_hour:02d}:{new_minute:02d}")
 
                 # 若是單次鬧鐘，響完後停用
                 if not a.get("weekdays") and not a.get("date"):
                     a["enabled"] = False
                     save_alarms()
 
-                await asyncio.sleep(60)  # 避免同分鐘重複響
+                await asyncio.sleep(60)  # 避免同分鐘重複觸發
 
         await asyncio.sleep(1)
-
 
 
 # === 主程式 ===
