@@ -52,11 +52,6 @@ def connect_wifi():
         print("未找到 wifi.txt，進入設定模式")
         return None
 
-    if wlan.isconnected():
-        ip = wlan.ifconfig()[0]
-        print("Wi-Fi 已連線:", ip)
-        return ip
-
     print(f"Connecting to {ssid}...")
     try:
         wlan.connect(ssid, password)
@@ -148,12 +143,12 @@ async def start_ap_server():
     wlan = network.WLAN(network.AP_IF)
     wlan.active(True)
     wlan.config(essid="ESP32_Setup", password="12345678")
-
+    ip = wlan.ifconfig()[0] #修改
     oled.fill(0)
     oled.text("SET WIFI SSID:", 0, 0)
     oled.text("ESP32_Setup", 0, 16)
     oled.text("Web IP:", 0, 32)
-    oled.text("192.168.4.1", 0, 48)
+    oled.text(ip, 0, 48) #修改
     oled.show()
 
     server = await asyncio.start_server(AP_client, "0.0.0.0", 80)
@@ -185,30 +180,6 @@ async def read_dht_task():
             print("讀取 DHT11 失敗:", e)
         await asyncio.sleep(10)  # 每3秒更新一次
         
-def get_next_alarm():
-    """
-    找到下一個即將響的鬧鐘時間
-    回傳 (hour, minute) tuple，如果沒有鬧鐘回傳 None
-    """
-    now = get_local_time()
-    now_minutes = now[3] * 60 + now[4]  # 現在時間轉成分鐘
-
-    # 將鬧鐘時間也轉成分鐘
-    alarm_minutes = [(a["hour"]*60 + a["minute"], a) for a in alarms]
-
-    # 計算距離現在最近的鬧鐘（可以跨天）
-    min_diff = 24*60 + 1
-    next_alarm = None
-    for am, a in alarm_minutes:
-        diff = am - now_minutes
-        if diff < 0:
-            diff += 24*60  # 跨天
-        if diff < min_diff:
-            min_diff = diff
-            next_alarm = a
-
-    return next_alarm
-
 
 # === OLED 顯示任務 ===
 async def display_task():
@@ -255,8 +226,6 @@ async def display_task():
             if a.get("weekdays"):  # 週期鬧鐘
                 days_str = ",".join(a["weekdays"])
                 oled.text(f"Days: {days_str}", 0, 50)
-            elif a.get("date"):  # 單次鬧鐘
-                oled.text(f"Date: {a['date']}", 0, 50)
             else:  # 每天響
                 oled.text("Every day", 0, 50)
         else:
@@ -296,22 +265,7 @@ async def play_song_async(speaker, notes, stop_event):
     speaker.duty(0)
 
 
-# === 非同步鬧鐘響起 ===
-async def ring_buzzer(duration=10):
-    print("鬧鐘響起，播放音樂！")
-    start = time.time()
-
-    # 重新初始化 speaker（確保可用）
-    global buzzer
-    buzzer = PWM(Pin(6))
-    buzzer.duty(0)
-
-    # 播放音樂（可改 NOTES_TWINKLE → NOTES_1, NOTES_2...）
-    await play_song_async(buzzer, NOTES_TWINKLE)
-
-    buzzer.duty(0)
-    print("音樂播放結束")
-    
+# === 非同步鬧鐘響起 ===  
 alarms = []
 
 def load_alarms():
@@ -480,27 +434,28 @@ async def start_webserver():
     print("WebServer 啟動中 http://<ESP32_IP>/")
     async with server:
         await server.wait_closed()
+        
 # ===== 鬧鐘檢查任務 =====
+# next_snooze_time = None
+
 async def alarm_task(snooze_minutes=5, max_ring_time=60):
-    """鬧鐘任務，支援手動停止、自動停止、延後"""
+
     while True:
         now = get_local_time()
         h, m = now[3], now[4]
         today_weekday = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][now[6]]
-        today_date = f"{now[0]:04d}-{now[1]:02d}-{now[2]:02d}"
 
         for a in alarms:
             if not a.get("enabled", True):
                 continue
 
-            # === 是否今日需響 ===
+            # === 移除日期判斷，只依照 weekday  ===
             is_today = False
-            if a.get("date"):  # 指定日期鬧鐘
-                is_today = a["date"] == today_date
-            elif a.get("weekdays"):  # 指定星期
+            if a.get("weekdays"):  
                 is_today = today_weekday in a["weekdays"]
-            else:  # 無指定 → 每天
+            else:
                 is_today = True
+            
 
             # === 鬧鐘觸發 ===
             if is_today and a["hour"] == h and a["minute"] == m:
@@ -510,11 +465,19 @@ async def alarm_task(snooze_minutes=5, max_ring_time=60):
                 ring_task = asyncio.create_task(play_song_async(buzzer, NOTES_TWINKLE, stop_event))
                 start_time = time.time()
 
+                snooze_pressed = False  # ← 加這行用來記錄延後
+
                 while True:
                     await asyncio.sleep(0.1)
 
-                    # 手動停止（任一按鈕）
-                    if button.value() == 0 or button_next.value() == 0:
+#                     #判斷兩個按鍵
+#                     if button_next.value() == 0:     # 延後按鈕
+#                         print("延後按鈕按下")
+#                         snooze_pressed = True
+#                         stop_event.set()
+#                         break
+
+                    if button.value() == 0:          # 停止按鈕
                         print("鬧鐘手動停止")
                         stop_event.set()
                         break
@@ -525,27 +488,23 @@ async def alarm_task(snooze_minutes=5, max_ring_time=60):
                         stop_event.set()
                         break
 
-                await ring_task  # 等待播放結束
+                await ring_task
                 buzzer.duty(0)
 
-                # === 延後功能 ===
-                if button_next.value() == 0:  # 按下「延後」
-                    new_minute = m + snooze_minutes
-                    new_hour = h + new_minute // 60
-                    new_minute %= 60
-                    new_hour %= 24
-                    delayed_alarm = {
-                        "hour": new_hour,
-                        "minute": new_minute,
-                        "weekdays": [],  # 單次響
-                        "enabled": True
-                    }
-                    alarms.append(delayed_alarm)
-                    save_alarms()
-                    print(f"延後 {snooze_minutes} 分鐘 → 新鬧鐘 {new_hour:02d}:{new_minute:02d}")
+#                 # === 延後功能 ===
+#                 if snooze_pressed:
+#                     new_minute = m + snooze_minutes
+#                     new_hour = h + new_minute // 60
+#                     new_minute %= 60
+#                     new_hour %= 24
+# 
+#                     # 只記錄到記憶體，不寫入 alarms.json
+#                     next_snooze_time = (new_hour, new_minute)
+# 
+#                     print(f"延後 {snooze_minutes} 分鐘 → Snooze 設定為 {new_hour:02d}:{new_minute:02d}")
 
-                # 若是單次鬧鐘，響完後停用
-                if not a.get("weekdays") and not a.get("date"):
+                # === 單次鬧鐘響完後停用 ===
+                if not a.get("weekdays"):
                     a["enabled"] = False
                     save_alarms()
 
@@ -587,6 +546,7 @@ try:
     asyncio.run(main())
 except KeyboardInterrupt:
     print("程式結束")
+
 
 
 
